@@ -15,8 +15,13 @@ class FileUtils {
         callback(null, err);
         return;
       }
-      var obj = JSON.parse(data);
-      callback(obj);
+      try {
+        let obj = JSON.parse(data);
+        callback(obj);
+      } catch (error) {
+        console.error("Error parsing json data at path", path, error);
+        callback(null);
+      }
     });
   }
 

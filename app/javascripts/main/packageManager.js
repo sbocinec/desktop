@@ -38,7 +38,7 @@ class PackageManager {
     }
   }
 
-  installComponent(component) {
+  async installComponent(component) {
     let downloadUrl = component.content.package_info.download_url;
     if(!downloadUrl) {
       return;
@@ -46,66 +46,97 @@ class PackageManager {
 
     console.log("Installing component", component.content.name, downloadUrl);
 
-    let callback = (installedComponent, error) => {
-      this.window.webContents.send("install-component-complete", {component: installedComponent, error: error});
+    return new Promise((resolve, reject) => {
+      
+      let callback = (installedComponent, error) => {
+        this.window.webContents.send("install-component-complete", {component: installedComponent, error: error});
+        resolve();
+      }
+  
+      let paths = this.pathsForComponent(component);
+  
+      fileUtils.downloadFile(downloadUrl, paths.downloadPath, (error) => {
+        if(!error) {
+          // Delete any existing content, especially in the case of performing an update
+          fileUtils.deleteAppRelativeDirectory(paths.relativePath);
+  
+          // Extract contents
+          this.unzipFile(paths.downloadPath, paths.absolutePath, (err) => {
+            if(!err) {
+              this.unnestPackageContents(paths.absolutePath, () => {
+                // Find out main file
+                fileUtils.readJSONFile(paths.absolutePath + "/package.json", (response, error) => {
+                  var main;
+                  if(response) {
+                    if(response.sn) { main = response["sn"]["main"]; }
+                    if(response.version) { component.content.package_info.version = response.version; }
+                  }
+                  if(!main) { main = "index.html"; }
+  
+                  component.content.local_url = "sn://" + paths.relativePath + "/" + main;
+                  callback(component);
+  
+                  // Update mapping file
+                  this.updateMappingObject(component.uuid, paths.relativePath);
+                })
+              })
+            } else {
+              // Unzip error
+              console.log("Unzip error for", component.content.name);
+              callback(component, {tag: "error-unzipping"})
+            }
+          });
+        } else {
+          // Download error
+          callback(component, {tag: "error-downloading"})
+        }
+      });
+    })
+  }
+
+  async getMappingObject() {
+    if(this.mappingObject) {
+      return this.mappingObject;
     }
 
-    let paths = this.pathsForComponent(component);
+    this.mappingObject = new Promise((resolve, reject) => {
+      fileUtils.readJSONFile(MappingFileLocation, (response, error) => {
+        resolve(response || {});
+      })
+    })
 
-    fileUtils.downloadFile(downloadUrl, paths.downloadPath, (error) => {
-      if(!error) {
-        // Delete any existing content, especially in the case of performing an update
-        fileUtils.deleteAppRelativeDirectory(paths.relativePath);
+    return this.mappingObject;
+  }
 
-        // Extract contents
-        this.unzipFile(paths.downloadPath, paths.absolutePath, (err) => {
-          if(!err) {
-            this.unnestPackageContents(paths.absolutePath, () => {
-              // Find out main file
-              fileUtils.readJSONFile(paths.absolutePath + "/package.json", (response, error) => {
-                var main;
-                if(response) {
-                  if(response.sn) { main = response["sn"]["main"]; }
-                  if(response.version) { component.content.package_info.version = response.version; }
-                }
-                if(!main) { main = "index.html"; }
+  saveMappingObject() {
+    // Debounce saving
+    const debounceInterval = 3000;
+    if(this.saveMappingTimeout) {
+      clearTimeout(this.saveMappingTimeout);
+    }
 
-                component.content.local_url = "sn://" + paths.relativePath + "/" + main;
-                callback(component);
-
-                // Update mapping file
-                this.updateMappingFile(component.uuid, paths.relativePath);
-              })
-            })
-          } else {
-            // Unzip error
-            console.log("Unzip error for", component.content.name);
-            callback(component, {tag: "error-unzipping"})
-          }
+    this.saveMappingTimeout = setTimeout(async () => {
+      let mappingObject = await this.getMappingObject();
+      return new Promise((resolve, reject) => {
+        fs.writeFile(MappingFileLocation, JSON.stringify(mappingObject, null, 2), 'utf8', (err) => {
+          if (err) console.log("Mapping file save error:", err);
+          resolve();
         });
-      } else {
-        // Download error
-        callback(component, {tag: "error-downloading"})
-      }
-    });
+      })
+    }, debounceInterval)
   }
 
   /*
     Maintains a JSON file which maps component ids to their installation location. This allows us to uninstall components
     when they are deleted and do not have any `content`. We only have their uuid to go by.
    */
-  updateMappingFile(componentId, componentPath) {
-    fileUtils.readJSONFile(MappingFileLocation, (response, error) => {
-      if(!response) response = {};
+  async updateMappingObject(componentId, componentPath) {
+    let mappingObject = await this.getMappingObject();
+    var obj = mappingObject[componentId] || {};
+    obj["location"] = componentPath;
+    mappingObject[componentId] = obj;
 
-      var obj = response[componentId] || {};
-      obj["location"] = componentPath;
-      response[componentId] = obj;
-
-      fs.writeFile(MappingFileLocation, JSON.stringify(response, null, 2), 'utf8', (err) => {
-        if(err) console.log("Mapping file save error:", err);
-      });
-    })
+    this.saveMappingObject();
   }
 
   syncComponents(components) {
@@ -127,14 +158,14 @@ class PackageManager {
       }
 
       let paths = this.pathsForComponent(component);
-      fs.stat(paths.absolutePath, (err, stats) => {
+      fs.stat(paths.absolutePath, async (err, stats) => {
         var doesntExist = err && err.code === 'ENOENT';
         if(doesntExist || !component.content.local_url) {
           // Doesn't exist, install it
-          this.installComponent(component);
+          await this.installComponent(component);
         } else if(!component.content.autoupdateDisabled) {
           // Check for updates
-          this.checkForUpdate(component);
+          await this.checkForUpdate(component);
         } else {
           // Already exists or update update disabled
           console.log("Not installing component", component.content.name,  "Already exists?", !doesntExist);
@@ -150,19 +181,26 @@ class PackageManager {
       return;
     }
 
-    request.get(latestURL, async (error, response, body) => {
-      if(response.statusCode == 200) {
-        var payload = JSON.parse(body);
-        let installedVersion = await this.getInstalledVersionForComponent(component);
-        console.log("Checking for update for:", component.content.name, "Latest Version:", payload.version, "Installed Version", installedVersion);
-        if(payload && payload.version && compareVersions(payload.version, installedVersion) == 1) {
-          // Latest version is greater than installed version
-          console.log("Downloading new version", payload.download_url);
-          component.content.package_info.download_url = payload.download_url;
-          component.content.package_info.version = payload.version;
-          this.installComponent(component);
+    return new Promise((resolve, reject) => {
+      request.get(latestURL, async (error, response, body) => {
+        if(response.statusCode == 200) {
+          var payload = JSON.parse(body);
+          let installedVersion = await this.getInstalledVersionForComponent(component);
+          let hasUpdate = payload && payload.version && compareVersions(payload.version, installedVersion) == 1;
+          console.log("Checking for update for:", component.content.name, "Latest Version:", payload.version, "Installed Version", installedVersion);
+          if(hasUpdate) {
+            // Latest version is greater than installed version
+            console.log("Downloading new version", payload.download_url);
+            component.content.package_info.download_url = payload.download_url;
+            component.content.package_info.version = payload.version;
+            resolve(this.installComponent(component));
+          } else {
+            resolve();
+          }
+        } else {
+          resolve();
         }
-      }
+      })
     })
   }
 
@@ -182,30 +220,25 @@ class PackageManager {
     })
   }
 
-  uninstallComponent(component) {
+  async uninstallComponent(component) {
     console.log("Uninstalling component", component.uuid);
-    fileUtils.readJSONFile(MappingFileLocation, (response, error) => {
-      if(!response) {
-        // No mapping.json means nothing is installed
-        return;
-      }
+    let mappingObject = await this.getMappingObject();
+    if (!mappingObject) {
+      // No mapping.json means nothing is installed
+      return;
+    }
 
-      // Get installation location
-      var mapping = response[component.uuid];
-      if(!mapping || !mapping.location) {
-        return;
-      }
+    // Get installation location
+    var mapping = mappingObject[component.uuid];
+    if(!mapping || !mapping.location) {
+      return;
+    }
 
-      let location = mapping["location"];
+    let location = mapping["location"];
+    fileUtils.deleteAppRelativeDirectory(location);
 
-      fileUtils.deleteAppRelativeDirectory(location);
-
-      delete response[component.uuid];
-
-      fs.writeFile(MappingFileLocation, JSON.stringify(response, null, 2), 'utf8', (err) => {
-        if(err) console.log("Uninstall, mapping file save error:", err);
-      });
-    })
+    delete mappingObject[component.uuid];
+    return this.saveMappingObject();
   }
 
 
